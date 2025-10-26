@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from datetime import datetime
 from typing import Iterable, Optional
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -41,10 +42,9 @@ def main() -> int:
     )
     missing = [name for name, value in env_pairs if not value]
     if missing:
-        print(
-            "Missing required environment variables: " + ", ".join(missing),
-            file=sys.stderr,
-        )
+        message = "Missing required environment variables: " + ", ".join(missing)
+        print(message, file=sys.stderr)
+        send_telegram_notification(False, email, f"Missing credentials: {', '.join(missing)}")
         return 1
 
     try:
@@ -61,16 +61,23 @@ def main() -> int:
             finally:
                 browser.close()
     except TwoFactorOrCaptchaDetected as exc:
-        print(str(exc), file=sys.stderr)
+        detail = _compact_text(str(exc)) or "Two-factor or CAPTCHA required."
+        print(detail, file=sys.stderr)
+        send_telegram_notification(False, email, detail)
         return TWO_FACTOR_EXIT_CODE
     except TransientPageState as exc:
-        print(f"Login attempt encountered a transient issue: {exc}", file=sys.stderr)
+        detail = _compact_text(str(exc)) or "Transient issue encountered."
+        print(f"Login attempt encountered a transient issue: {detail}", file=sys.stderr)
+        send_telegram_notification(False, email, detail)
         return TRANSIENT_EXIT_CODE
     except Exception as exc:  # noqa: BLE001
-        print(f"Login attempt failed: {exc}", file=sys.stderr)
+        detail = _compact_text(str(exc)) or exc.__class__.__name__
+        print(f"Login attempt failed: {detail}", file=sys.stderr)
+        send_telegram_notification(False, email, f"Unexpected error: {detail}")
         return 1
 
     print("Login succeeded")
+    send_telegram_notification(True, email, "")
     return 0
 
 
@@ -284,6 +291,95 @@ def login_successful(page) -> bool:
             continue
 
     return False
+
+
+def mask_email(email: Optional[str]) -> str:
+    if not email:
+        return "<unknown email>"
+    stripped = email.strip()
+    if not stripped:
+        return "<unknown email>"
+    if "@" not in stripped:
+        return f"{stripped[0]}***" if stripped else "<unknown email>"
+    local_part, _, domain = stripped.partition("@")
+    if not local_part:
+        return f"***@{domain}"
+    return f"{local_part[0]}***@{domain}"
+
+
+def _compact_text(value: str) -> str:
+    if not value:
+        return ""
+    compact = " ".join(value.strip().split())
+    return compact[:400]
+
+
+def send_telegram_notification(success: bool, email: Optional[str], reason: str) -> None:
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    masked = mask_email(email)
+
+    if success:
+        text = f"Webhostmost login succeeded at {timestamp} for {masked}."
+    else:
+        detail = _compact_text(reason)
+        if detail:
+            text = f"Webhostmost login failed at {timestamp} for {masked}: {detail}"
+        else:
+            text = f"Webhostmost login failed at {timestamp} for {masked}."
+
+    send_tg(text)
+
+
+def send_tg(text: str) -> bool:
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+
+    if not (token and chat_id):
+        return False
+
+    try:
+        import requests
+    except ImportError:
+        print(
+            "Telegram notification skipped: requests library unavailable",
+            file=sys.stderr,
+        )
+        return False
+
+    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+
+    try:
+        response = requests.post(api_url, data=payload, timeout=10)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Telegram notification failed: {exc.__class__.__name__}",
+            file=sys.stderr,
+        )
+        return False
+
+    if response.status_code >= 400:
+        print(f"Telegram notification failed: HTTP {response.status_code}", file=sys.stderr)
+        return False
+
+    try:
+        response_json = response.json()
+    except Exception:  # noqa: BLE001
+        response_json = None
+
+    if isinstance(response_json, dict) and not response_json.get("ok", True):
+        description = _compact_text(str(response_json.get("description", "")))
+        if description:
+            print(f"Telegram notification failed: {description}", file=sys.stderr)
+        else:
+            print("Telegram notification failed: Telegram API returned ok=false", file=sys.stderr)
+        return False
+
+    print("Telegram notification sent")
+    return True
 
 
 if __name__ == "__main__":
